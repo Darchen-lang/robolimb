@@ -1,0 +1,12 @@
+.env
+.env.*
+*.env
+
+# Local models
+model/
+vosk-model-small-en-in-0.4/
+
+# IDE/editor/project files
+.vscode/
+.idea/
+*.swp
