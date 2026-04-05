@@ -10,3 +10,5 @@ vosk-model-small-en-in-0.4/
 .vscode/
 .idea/
 *.swp
+
+__pycache__/
