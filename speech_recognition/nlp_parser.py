@@ -2,17 +2,29 @@ import os
 import json
 import logging
 import time
+import re
 from typing import Any, Dict, Optional
 from dataclasses import dataclass
 from dotenv import load_dotenv
 from openai import OpenAI, APIError, APIConnectionError, RateLimitError
 
-load_dotenv()
+WORKSPACE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT_DOTENV = os.path.join(WORKSPACE_ROOT, ".env")
+
+# Load root .env explicitly because runtime code changes cwd.
+load_dotenv(dotenv_path=ROOT_DOTENV)
 
 logger = logging.getLogger(__name__)
 
-_api_key = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=_api_key) if _api_key else None
+_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPEN_API_KEY")
+_openai_init_error: Optional[str] = None
+client = None
+if _api_key:
+    try:
+        client = OpenAI(api_key=_api_key)
+    except Exception as e:
+        _openai_init_error = str(e)
+        logger.warning(f"OpenAI client initialization failed; using local parser fallback: {_openai_init_error}")
 
 
 @dataclass
@@ -27,6 +39,57 @@ class ParsedCommand:
 
     def is_error(self) -> bool:
         return self.error is not None
+
+
+def parse_text_locally(text: str) -> ParsedCommand:
+    """Best-effort local parser used when OpenAI is unavailable."""
+    raw_text = text.strip()
+    normalized = raw_text.lower()
+    normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    if not normalized:
+        return ParsedCommand(
+            intent="empty",
+            raw_text=raw_text,
+            error="empty_input",
+            message="No text provided",
+        )
+
+    if "stop" in normalized:
+        return ParsedCommand(intent="stop", arguments={}, confidence=0.9, raw_text=raw_text)
+
+    if any(token in normalized for token in ("home", "go home", "return home")):
+        return ParsedCommand(intent="home", arguments={}, confidence=0.9, raw_text=raw_text)
+
+    if "open" in normalized:
+        return ParsedCommand(intent="open", arguments={}, confidence=0.85, raw_text=raw_text)
+
+    if any(token in normalized for token in ("close", "shut")):
+        return ParsedCommand(intent="close", arguments={}, confidence=0.85, raw_text=raw_text)
+
+    pick_words = ("pick", "grab", "take", "lift")
+    if any(word in normalized for word in pick_words):
+        target = normalized
+        for phrase in (
+            "pick up the", "pick up", "pick the", "pick",
+            "grab the", "grab", "take the", "take", "lift the", "lift",
+            "please", "can you", "could you",
+        ):
+            target = target.replace(phrase, " ")
+        target = re.sub(r"\b(it|this|that|object)\b", " ", target)
+        target = re.sub(r"\s+", " ", target).strip()
+        arguments: Dict[str, Any] = {}
+        if target:
+            arguments["target_object"] = target
+        return ParsedCommand(
+            intent="pick",
+            arguments=arguments,
+            confidence=0.8 if target else 0.65,
+            raw_text=raw_text,
+        )
+
+    return ParsedCommand(intent="unknown", arguments={}, confidence=0.3, raw_text=raw_text)
 
 
 def parse_text_with_openai(
@@ -54,19 +117,25 @@ def parse_text_with_openai(
         )
 
     if client is None:
-        return ParsedCommand(
-            intent="error",
-            raw_text=text,
-            error="no_api_key",
-            message="OPENAI_API_KEY not configured",
-        )
+        local_result = parse_text_locally(text)
+        if _api_key and _openai_init_error:
+            logger.info(f"OpenAI unavailable ({_openai_init_error}); using local parser fallback")
+        else:
+            logger.info("OPENAI_API_KEY not configured; using local parser fallback")
+        return local_result
 
     # Sanitize text
     sanitized_text = text.strip()[:1000]  # Limit to 1000 chars
     system_prompt = (
-        "You are a command parser for a robotic limb. "
+        "You are a command parser for a robotic arm that picks up objects. "
         "Given user speech, extract a structured command. "
-        "Return ONLY valid JSON with keys: intent (string), arguments (object), confidence (0-1)."
+        "Return ONLY valid JSON with keys: intent (string), arguments (object), confidence (0-1). "
+        "\n"
+        "Intents can be: 'pick', 'open', 'close', 'home', 'stop', or 'unknown'. "
+        "For 'pick' intent, include target_object with the object name in arguments. "
+        "For example: if user says 'pick up the cup', return intent='pick' with arguments={'target_object': 'cup'}. "
+        "Examples: 'grab the ball' → intent='pick', arguments={'target_object': 'ball'}, confidence=0.95. "
+        "'open gripper' → intent='open', arguments={}, confidence=0.95."
     )
     user_prompt = (
         f"User said: {sanitized_text}\n"
@@ -148,12 +217,8 @@ def parse_text_with_openai(
                 wait = 2 ** attempt  # Exponential backoff
                 time.sleep(wait)
                 continue
-            return ParsedCommand(
-                intent="error",
-                raw_text=sanitized_text,
-                error="rate_limit",
-                message="API rate limit exceeded",
-            )
+            logger.warning("OpenAI rate limited; falling back to local parser")
+            return parse_text_locally(sanitized_text)
 
         except (APIConnectionError, TimeoutError) as e:
             logger.warning(f"Connection error (attempt {attempt + 1}/{max_retries}): {e}")
@@ -161,35 +226,19 @@ def parse_text_with_openai(
                 wait = 2 ** attempt
                 time.sleep(wait)
                 continue
-            return ParsedCommand(
-                intent="error",
-                raw_text=sanitized_text,
-                error="connection_error",
-                message=f"Failed to reach OpenAI API: {str(e)}",
-            )
+            logger.warning("OpenAI unavailable; falling back to local parser")
+            return parse_text_locally(sanitized_text)
 
         except APIError as e:
             logger.error(f"OpenAI API error: {e}")
-            return ParsedCommand(
-                intent="error",
-                raw_text=sanitized_text,
-                error="openai_error",
-                message=str(e),
-            )
+            logger.warning("OpenAI API error; falling back to local parser")
+            return parse_text_locally(sanitized_text)
 
         except Exception as e:
             logger.error(f"Unexpected error during parsing: {e}", exc_info=True)
-            return ParsedCommand(
-                intent="error",
-                raw_text=sanitized_text,
-                error="unexpected",
-                message=str(e),
-            )
+            logger.warning("Unexpected parser error; falling back to local parser")
+            return parse_text_locally(sanitized_text)
 
     # Should not reach here
-    return ParsedCommand(
-        intent="error",
-        raw_text=sanitized_text,
-        error="max_retries",
-        message=f"Exceeded max retries ({max_retries})",
-    )
+    logger.warning("Exceeded parser retries; falling back to local parser")
+    return parse_text_locally(sanitized_text)

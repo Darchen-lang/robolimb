@@ -10,9 +10,12 @@ from typing import List, Optional
 
 import sounddevice as sd
 import vosk
-from pynput import keyboard
 
 from nlp_parser import parse_text_with_openai
+
+# Add parent directory to path to import robot_coordinator
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from robot_coordinator import coordinator
 
 # Configure logging
 logging.basicConfig(
@@ -21,7 +24,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MODEL_PATH = os.getenv("VOSK_MODEL_PATH", "vosk-model-small-en-in-0.4")
+# Use absolute path for model
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.getenv("VOSK_MODEL_PATH", os.path.join(SCRIPT_DIR, "vosk-model-small-en-in-0.4"))
 SAMPLE_RATE = int(os.getenv("SAMPLE_RATE", "16000"))
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "20"))
 MAX_RECORDING_DURATION = int(os.getenv("MAX_RECORDING_DURATION", "15"))
@@ -31,6 +36,9 @@ audio_queue: queue.Queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
 
 # Parser queue: recognized text waits here to be parsed by a worker thread
 parser_queue: queue.Queue = queue.Queue(maxsize=50)
+
+# Recording control queue: press Enter to start, Enter again to stop
+recording_control_queue: queue.Queue = queue.Queue(maxsize=10)
 
 # Control: signal to stop the main loop
 stop_event = threading.Event()
@@ -100,52 +108,112 @@ def parse_worker(transcription: List[str]) -> None:
 
 
 def _route_intent(intent: str, arguments: Optional[dict]) -> None:
-    """Simple intent routing. Extend as needed."""
+    """
+    Route parsed intents to robot actions.
+    Communicates with the robot coordinator to queue commands.
+    """
     intent_lower = intent.lower().strip()
+    arguments = arguments or {}
     
-    if intent_lower == "open":
+    if intent_lower in ("pick", "pick_object", "grab", "pick up"):
+        # Extract target object from arguments
+        target = arguments.get("target_object") or arguments.get("object")
+        
+        if target:
+            target_str = str(target).lower().strip()
+            logger.info(f"PICK command for: {target_str}")
+            print(f"🎯 Picking up: {target_str}")
+            
+            confidence = float(arguments.get("confidence", 0.75))
+            # Queue pick command to coordinator (will be handled by vision module)
+            coordinator.queue_pick_command(target_str, confidence)
+        else:
+            logger.warning("Pick command received but no target object specified")
+            print("⚠️ Pick command received but no target object specified")
+    
+    elif intent_lower == "open":
         logger.info("Command: OPEN GRIPPER")
         print("→ Command: OPEN GRIPPER")
-        # TODO: call robot's 'open' action
+        coordinator.queue_command("open_gripper")
+    
     elif intent_lower == "close":
         logger.info("Command: CLOSE GRIPPER")
         print("→ Command: CLOSE GRIPPER")
-        # TODO: call robot's 'close' action
-    elif intent_lower == "unknown" or intent_lower == "empty":
-        logger.debug(f"No recognized intent")
+        coordinator.queue_command("close_gripper")
+    
+    elif intent_lower == "home":
+        logger.info("Command: RETURN HOME")
+        print("🏠 Returning home...")
+        coordinator.queue_command("home")
+    
+    elif intent_lower == "stop":
+        logger.info("Command: STOP")
+        print("⏹️  Stopping operations...")
+        coordinator.queue_command("stop")
+    
+    elif intent_lower in ("unknown", "empty"):
+        logger.debug("No recognized intent")
+    
     else:
         logger.info(f"Unhandled intent: {intent}")
-        print(f"? Unhandled intent: {intent}")
+        print(f"❓ Unhandled intent: {intent} (args: {arguments})")
 
 
 
 
-def record_until_space_released(
+def control_input_worker() -> None:
+    """
+    Terminal control worker:
+    - Press Enter to start recording
+    - Press Enter again to stop recording
+    - Type 'q' + Enter to quit
+    """
+    while not stop_event.is_set():
+        try:
+            user_input = input().strip().lower()
+        except EOFError:
+            logger.info("Input stream closed; stopping listener")
+            stop_event.set()
+            break
+        except Exception as e:
+            logger.warning(f"Input worker error: {e}")
+            continue
+
+        if user_input in ("q", "quit", "exit"):
+            stop_event.set()
+            break
+
+        # Empty line means Enter key press for recording control.
+        if user_input == "":
+            with suppress(queue.Full):
+                recording_control_queue.put_nowait("toggle")
+
+
+def record_until_toggled_or_timeout(
     model: vosk.Model,
     max_duration_seconds: int,
 ) -> str:
     """
     Create a recognizer and feed it audio until:
-    - space is released, or
+    - Enter is pressed again (toggle stop), or
     - max_duration_seconds is reached.
 
     Returns the final Vosk result JSON string.
     """
     recognizer = vosk.KaldiRecognizer(model, SAMPLE_RATE)
     drain_audio_queue(audio_queue)
+    drain_audio_queue(recording_control_queue)
     
     start_time = time.time()
 
-    while True:
-        # Check if space is still pressed
+    while not stop_event.is_set():
+        # A second Enter stops the current recording.
         try:
-            space_pressed = keyboard.is_pressed("space")
-        except Exception as e:
-            logger.warning(f"Keyboard error: {e}, assuming space released")
-            space_pressed = False
-
-        if not space_pressed:
+            recording_control_queue.get_nowait()
+            logger.debug("Recording stopped by Enter key")
             break
+        except queue.Empty:
+            pass
 
         elapsed = time.time() - start_time
         if elapsed > max_duration_seconds:
@@ -231,11 +299,21 @@ def main() -> None:
     print("\n" + "=" * 50)
     print("🤖 RoboLimb Speech Listener")
     print("=" * 50)
-    print("Hold 'SPACE' to speak (max 15s)")
+    print("Press Enter to start recording (max 15s)")
+    print("Press Enter again to stop recording")
+    print("Type 'q' then Enter to quit speech listener")
     print("Press Ctrl+C to exit")
     print("=" * 50 + "\n")
 
     try:
+        # Start terminal input worker for Enter-based recording control.
+        control_thread = threading.Thread(
+            target=control_input_worker,
+            daemon=True,
+            name="ControlInput",
+        )
+        control_thread.start()
+
         # Open mic stream
         with sd.RawInputStream(
             samplerate=SAMPLE_RATE,
@@ -246,32 +324,26 @@ def main() -> None:
         ):
             logger.info("Microphone stream opened")
             print("✓ Microphone ready\n")
+            print("Press Enter to start your first recording...\n")
 
             while not stop_event.is_set():
                 try:
-                    space_pressed = keyboard.is_pressed("space")
-                except Exception as e:
-                    logger.debug(f"Keyboard check failed: {e}")
-                    space_pressed = False
+                    recording_control_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
 
-                if space_pressed:
-                    if not is_recording:
-                        is_recording = True
-                        recording_start_time = time.time()
-                        print("\n⏺️  Listening...")
-                        logger.debug("Recording started")
+                is_recording = True
+                recording_start_time = time.time()
+                print("\n⏺️  Listening... (press Enter to stop)")
+                logger.debug("Recording started")
 
-                    result_json = record_until_space_released(
-                        model=model,
-                        max_duration_seconds=MAX_RECORDING_DURATION,
-                    )
-                    handle_recognition_result(result_json, transcription)
-                    is_recording = False
-
-                else:
-                    if is_recording:
-                        is_recording = False
-                    time.sleep(0.05)
+                result_json = record_until_toggled_or_timeout(
+                    model=model,
+                    max_duration_seconds=MAX_RECORDING_DURATION,
+                )
+                handle_recognition_result(result_json, transcription)
+                is_recording = False
+                print("\nPress Enter to record again...\n")
 
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
