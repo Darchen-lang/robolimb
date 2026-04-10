@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from collections import deque
 from typing import Optional, Tuple, Dict, List
+import sys
 
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
@@ -19,6 +20,10 @@ import math
 import time
 import serial  # pip install pyserial  (for Arduino/servo communication)
 from ultralytics import YOLO
+
+# Import robot coordinator for speech integration
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from robot_coordinator import coordinator, RobotCommand
 
 # ═══════════════════════════════════════════════════════
 #  CONFIGURATION
@@ -499,6 +504,96 @@ def pick_object(controller: SerialController, ik: InverseKinematics,
 
 
 # ═══════════════════════════════════════════════════════
+#  COMMAND PROCESSING (from speech coordinator)
+# ═══════════════════════════════════════════════════════
+
+def process_pending_commands(detections: List[dict], controller: SerialController,
+                             ik: InverseKinematics) -> Optional[bool]:
+    """
+    Check for pending commands from the coordinator (speech module).
+    If a pick command is found, locate the object in detections and execute pick.
+    Returns True if a pick was executed, False if command failed, None if no commands.
+    """
+    cmd = coordinator.get_next_command(timeout=0.1)
+    if cmd is None:
+        return None
+    
+    print(f"\n[COORDINATOR] Received command: {cmd}")
+    
+    if cmd.command_type == "pick":
+        target_name = cmd.target_object
+        print(f"[PICK-COMMAND] Looking for '{target_name}' in scene...")
+        coordinator.post_status(f"searching_for_{target_name}", {"target": target_name})
+        
+        # Find matching object in detections
+        matching_detections = [
+            d for d in detections 
+            if target_name.lower() in d["label"].lower()
+        ]
+        
+        if not matching_detections:
+            print(f"[PICK-COMMAND] ❌ Object '{target_name}' not detected in scene")
+            coordinator.post_status("object_not_found", {"target": target_name})
+            return False
+        
+        # Select best detection (highest temporal confidence)
+        best_detection = max(matching_detections, key=lambda d: d["temporal_conf"])
+        
+        if best_detection["temporal_conf"] < cmd.confidence_threshold:
+            print(f"[PICK-COMMAND] ⚠️  Object confidence too low: {best_detection['temporal_conf']:.2f}")
+            coordinator.post_status("low_confidence", {
+                "target": target_name,
+                "confidence": best_detection["temporal_conf"]
+            })
+            return False
+        
+        print(f"[PICK-COMMAND] ✓ Found '{best_detection['label']}' with confidence {best_detection['temporal_conf']:.2f}")
+        coordinator.set_picking_state(True)
+        
+        # Execute pick
+        success = pick_object(
+            controller,
+            ik,
+            best_detection["pos3d"],
+            best_detection["label"]
+        )
+        
+        coordinator.set_picking_state(False)
+        if success:
+            coordinator.post_status("pick_complete", {"target": target_name})
+            print("[PICK-COMMAND] Pick operation completed successfully ✓")
+        else:
+            coordinator.post_status("pick_failed", {"target": target_name})
+            print("[PICK-COMMAND] Pick operation failed ❌")
+        
+        return success
+    
+    elif cmd.command_type == "home":
+        print(f"[COMMAND] Moving to home position...")
+        angles = ik.solve(0.0, 0.20, 0.25)
+        if angles:
+            angles = ik.clamp_angles(angles)
+            controller.send_angles(angles)
+            coordinator.post_status("at_home", {})
+        return None
+    
+    elif cmd.command_type in ("open_gripper", "close_gripper"):
+        gripper_state = GRIPPER_OPEN if cmd.command_type == "open_gripper" else GRIPPER_CLOSED
+        print(f"[COMMAND] {'Opening' if cmd.command_type == 'open_gripper' else 'Closing'} gripper...")
+        coordinator.post_status(cmd.command_type, {})
+        return None
+    
+    elif cmd.command_type == "stop":
+        print(f"[COMMAND] Stop command received")
+        coordinator.post_status("stopped", {})
+        return None
+    
+    else:
+        print(f"[COMMAND] Unknown command type: {cmd.command_type}")
+        return None
+
+
+# ═══════════════════════════════════════════════════════
 #  MAIN LOOP
 # ═══════════════════════════════════════════════════════
 
@@ -622,6 +717,9 @@ def main():
 
             # Cleanup stale tracks
             coord_tracker.cleanup(active_ids)
+
+            # Process any pending commands from coordinator (e.g., from speech module)
+            process_pending_commands(detections, controller, ik)
 
             status = f"Objects: {len(detections)}"
             cv2.putText(display_frame, status, (10, 22),
